@@ -1,23 +1,21 @@
-[build-system]
-requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "learn-gemini"
-version = "0.1.0"
-description = "Google Gemini Platform Masterclass: 2M+ Token Context, Native Multimodality, Context Caching & Search Grounding"
+version = "1.0.0"
+description = "Starter FastAPI service for the learn-gemini guide, built on the Google Gen AI SDK."
 readme = "README.md"
-authors = [{ name = "The Learning Hub Team" }]
 license = { text = "MIT" }
-requires-python = ">=3.11"
-dependencies = [
-    "typing_extensions>=4.12.0",
-]
+requires-python = ">=3.12"
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0.0",
-]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends"]

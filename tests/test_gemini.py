@@ -1,133 +1,96 @@
-"""
-Comprehensive Unit Tests for Google Gemini Enterprise Engine.
+from __future__ import annotations
 
-Tests:
-- Client configuration and content generation.
-- Long-context 2M token needle-in-a-haystack retrieval simulation.
-- Context Caching creation and token reduction.
-- Function calling and Google Search Grounding metadata.
-- Enterprise token cost calculator with caching discounts.
-- Pedagogical roadmap stage completion.
-"""
+import pytest
+from google.genai import types
 
-import unittest
-
-from src.learn_gemini.client import (
-    Content,
-    FunctionCallPart,
-    GeminiClient,
-    GeminiCostCalculator,
-    TextPart,
-    Tool,
+from app.config import Settings
+from app.gemini import (
+    GeminiBlocked,
+    GeminiService,
+    GeminiUnavailable,
+    build_client,
+    build_config,
+    check_finished,
+    usage_from,
 )
-from src.learn_gemini.roadmap import GeminiRoadmap
+from app.schemas import GenerateRequest
+from tests.conftest import FakeClient, make_response
 
 
-class TestGeminiEngine(unittest.TestCase):
-
-    def setUp(self) -> None:
-        self.client = GeminiClient(api_key="ai-studio-test-key")
-
-    def test_client_initialization(self) -> None:
-        self.assertEqual(self.client.api_key, "ai-studio-test-key")
-
-    def test_generate_content_standard(self) -> None:
-        response = self.client.generate_content(
-            model="gemini-1.5-pro",
-            contents="Explain TPU v5p architecture.",
-        )
-        self.assertTrue(len(response.candidates) > 0)
-        self.assertEqual(response.candidates[0].finish_reason, "STOP")
-        self.assertIn("Gemini", response.text)
-        self.assertTrue(response.usage_metadata.prompt_token_count > 0)
-        self.assertTrue(response.usage_metadata.candidates_token_count > 0)
-
-    def test_simulate_needle_retrieval(self) -> None:
-        result = self.client.simulate_needle_retrieval(
-            context_length_tokens=2_000_000,
-            needle="MISSION_CRITICAL_KEY_8832",
-            needle_depth_pct=45.0,
-        )
-        self.assertEqual(result["context_length_tokens"], 2_000_000)
-        self.assertEqual(result["recall_score"], 1.0)
-        self.assertTrue(result["retrieved_successfully"])
-        self.assertIn("MISSION_CRITICAL_KEY_8832", result["retrieved_text"])
-
-    def test_context_caching(self) -> None:
-        doc = Content(role="user", parts=[TextPart(text="Enterprise documentation " * 500)])
-        cached = self.client.create_cached_content(
-            model="gemini-1.5-pro",
-            contents=[doc],
-            ttl_seconds=1800,
-        )
-        self.assertIn(cached.name, self.client.cached_contents)
-        self.assertTrue(cached.token_count >= 32768)
-
-        # Generate using cached resource
-        res = self.client.generate_content(
-            model="gemini-1.5-pro",
-            contents="Summarize documentation.",
-            cached_content=cached.name,
-        )
-        self.assertEqual(res.usage_metadata.cached_content_token_count, cached.token_count)
-        self.assertTrue(res.usage_metadata.prompt_token_count > cached.token_count)
-
-    def test_tool_calling_function(self) -> None:
-        tool = Tool(
-            function_declarations=[
-                {
-                    "name": "lookup_customer_balance",
-                    "description": "Returns account balance for a given customer ID.",
-                    "parameters": {"type": "object", "properties": {"customer_id": {"type": "string"}}},
-                }
-            ]
-        )
-        response = self.client.generate_content(
-            model="gemini-1.5-flash",
-            contents="Please call lookup_customer_balance for customer 451.",
-            tools=[tool],
-        )
-        self.assertEqual(len(response.candidates), 1)
-        part = response.candidates[0].content.parts[0]
-        self.assertIsInstance(part, FunctionCallPart)
-        self.assertEqual(part.name, "lookup_customer_balance")
-
-    def test_google_search_grounding(self) -> None:
-        tool = Tool(google_search=True)
-        response = self.client.generate_content(
-            model="gemini-1.5-flash",
-            contents="Latest AI news today.",
-            tools=[tool],
-        )
-        self.assertIsNotNone(response.candidates[0].grounding_metadata)
-        gm = response.candidates[0].grounding_metadata
-        self.assertTrue(len(gm.web_search_queries) > 0)
-        self.assertTrue(len(gm.grounding_chunks) > 0)
-
-    def test_cost_calculator(self) -> None:
-        # 1M prompt, 1M completion on gemini-1.5-pro with 800k cached
-        cost = GeminiCostCalculator.calculate_cost(
-            model="gemini-1.5-pro",
-            prompt_tokens=1_000_000,
-            completion_tokens=1_000_000,
-            cached_tokens=800_000,
-        )
-
-        # Baseline: 1M (>128k) @ $2.50 + 1M output @ $5.00 = $7.50
-        self.assertAlmostEqual(cost["baseline_cost"], 7.50, places=2)
-        # With 800k cached @ $0.3125/1M ($0.25) + 200k uncached @ $2.50/1M ($0.50) + 1M output @ $5.00 = $5.75
-        self.assertAlmostEqual(cost["total_cost"], 5.75, places=2)
-        self.assertTrue(cost["savings_usd"] > 0)
-
-    def test_roadmap_progress(self) -> None:
-        roadmap = GeminiRoadmap()
-        self.assertEqual(len(roadmap.stages), 7)
-        self.assertEqual(roadmap.total_progress(), 100.0)
-        summary = roadmap.get_summary()
-        self.assertEqual(summary["total_stages"], 7)
-        self.assertEqual(summary["completed_stages"], 7)
-        self.assertEqual(summary["overall_progress_pct"], 100.0)
+def test_build_config_sends_only_fields_that_were_set() -> None:
+    config = build_config(GenerateRequest(prompt="hi"))
+    assert config.temperature is None
+    assert config.system_instruction is None
+    assert config.thinking_config is None
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_build_config_maps_thinking_level_to_sdk_enum() -> None:
+    config = build_config(
+        GenerateRequest(prompt="hi", thinking_level="low", temperature=0.4, max_output_tokens=256)
+    )
+    assert config.thinking_config is not None
+    assert config.thinking_config.thinking_level == types.ThinkingLevel.LOW
+    assert config.temperature == 0.4
+    assert config.max_output_tokens == 256
+
+
+def test_usage_reads_thinking_and_cached_tokens() -> None:
+    usage = usage_from(make_response(prompt_tokens=10, output_tokens=5, thinking_tokens=20))
+    assert usage.prompt_tokens == 10
+    assert usage.output_tokens == 5
+    assert usage.thinking_tokens == 20
+    assert usage.total_tokens == 35
+
+
+@pytest.mark.parametrize("reason", ["STOP", "MAX_TOKENS"])
+def test_check_finished_accepts_normal_endings(reason: str) -> None:
+    assert check_finished(make_response(finish_reason=reason)) == reason
+
+
+def test_check_finished_raises_on_blocked_prompt() -> None:
+    with pytest.raises(GeminiBlocked, match="prompt blocked"):
+        check_finished(make_response(block_reason="SAFETY"))
+
+
+def test_check_finished_raises_on_safety_stop() -> None:
+    with pytest.raises(GeminiBlocked, match="SAFETY"):
+        check_finished(make_response(finish_reason="SAFETY"))
+
+
+def test_generate_passes_model_and_prompt(settings: Settings, fake_client: FakeClient) -> None:
+    service = GeminiService(fake_client, settings)
+    text, finish, usage = service.generate(GenerateRequest(prompt="Explain TPUs"))
+    call = fake_client.models.calls[-1]
+    assert call["model"] == "gemini-test-model"
+    assert call["contents"] == "Explain TPUs"
+    assert (text, finish, usage.total_tokens) == ("hello", "STOP", 10)
+
+
+def test_stream_yields_only_text_deltas(settings: Settings, fake_client: FakeClient) -> None:
+    fake_client.models.stream_chunks = ["a", "", "b"]
+    service = GeminiService(fake_client, settings)
+    assert list(service.stream(GenerateRequest(prompt="x"))) == ["a", "b"]
+
+
+def test_triage_requests_json_schema(settings: Settings, fake_client: FakeClient) -> None:
+    fake_client.models.next_response = make_response(
+        '{"category":"bug","priority":"p1","summary":"Export fails.","needs_human":false}'
+    )
+    result = GeminiService(fake_client, settings).triage("CSV export returns 500")
+    config = fake_client.models.calls[-1]["config"]
+    assert config.response_mime_type == "application/json"
+    assert config.response_json_schema["properties"]["priority"]["enum"] == ["p0", "p1", "p2", "p3"]
+    assert result.category == "bug"
+
+
+def test_build_client_refuses_without_credentials() -> None:
+    with pytest.raises(GeminiUnavailable):
+        build_client(Settings(api_key=None))
+
+
+def test_build_client_with_key_creates_developer_api_client() -> None:
+    client = build_client(Settings(api_key="fake-key"))
+    try:
+        assert client.vertexai is False
+    finally:
+        client.close()
